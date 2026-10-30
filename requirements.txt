@@ -1,0 +1,36 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Chart Pattern Detection System — NIFTY 50
+# Requirements File
+#
+# Install into a fresh virtual environment:
+#   python -m venv .venv
+#   .venv\Scripts\activate          (Windows)
+#   source .venv/bin/activate       (Linux / macOS)
+#   pip install -r requirements.txt
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Core Data ─────────────────────────────────────────────────────────────────
+pandas==2.2.3                   # DataFrames, resampling, time-series ops
+numpy==2.2.6                    # Numerical arrays, argrelextrema
+
+# ── HTTP / Data Fetching ──────────────────────────────────────────────────────
+requests==2.33.1                # QuestDB REST API (/exec endpoint)
+
+# ── Signal Processing & Statistics ───────────────────────────────────────────
+scipy==1.16.3                   # argrelextrema (swing detection), linregress
+
+# ── Charting ─────────────────────────────────────────────────────────────────
+matplotlib==3.10.5              # Core plotting engine (Agg backend)
+mplfinance==0.12.10b0           # Candlestick rendering helpers
+
+# ── Export ───────────────────────────────────────────────────────────────────
+openpyxl==3.1.5                 # Excel export support (optional)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Dev / Optional
+# Uncomment if you want Jupyter notebook support or linting
+# ─────────────────────────────────────────────────────────────────────────────
+# jupyter>=1.0.0
+# ipykernel>=6.0.0
+# black>=24.0.0
+# ruff>=0.4.0
