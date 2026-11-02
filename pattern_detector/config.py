@@ -9,7 +9,8 @@ QUESTDB_TABLE = "nse_nifty_50"
 SYMBOL = "NIFTY 50"
 
 # ─── Analysis Window ──────────────────────────────────────────────────────────
-LOOKBACK_DAYS = 365          # Last 1 year
+# LOOKBACK_DAYS = 365          # Last 1 year
+LOOKBACK_DAYS = 1000          # Last 1 year
 TIMEFRAME = "1min"           # Source resolution
 # RESAMPLE_TO = "15min"        # Resample 1-min → 15-min for cleaner pattern detection
                               # Options: "1min", "5min", "15min", "30min", "1H", "1D"
