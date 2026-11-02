@@ -872,24 +872,71 @@ ALL_DETECTORS = [
 ]
 
 
+def _session_frames(df: pd.DataFrame):
+    """Yield (local frame, position map) for each trading day.
+
+    Detectors see one session at a time, so swing points cannot connect
+    the close of one day to the open of the next.
+    """
+    ts = pd.DatetimeIndex(df.index)
+    if ts.tz is not None:
+        ts = ts.tz_convert("UTC").tz_localize(None)
+    day_keys = ts.normalize()
+    min_bars = PIVOT_WINDOW * 2 + 5
+
+    for day in pd.unique(day_keys):
+        positions = np.flatnonzero(day_keys == day)
+        if len(positions) < min_bars:
+            continue
+        if positions[-1] - positions[0] + 1 == len(positions):
+            local = df.iloc[int(positions[0]): int(positions[-1]) + 1]
+            index_map = None
+            offset = int(positions[0])
+        else:
+            local = df.iloc[positions]
+            index_map = positions
+            offset = 0
+        yield local, index_map, offset
+
+
 def detect_all_patterns(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Run every detector and return a deduplicated, sorted DataFrame of patterns.
+    Run every detector inside each trading session and return a
+    deduplicated, sorted DataFrame of intraday patterns.
     """
     all_patterns: PatternList = []
+    counts = {name: 0 for name, _ in ALL_DETECTORS}
+    n_sessions = 0
 
-    for name, detector in ALL_DETECTORS:
-        try:
-            found = detector(df)
-            print(f"  [{name}]: {len(found)} pattern(s) found")
+    for local, index_map, offset in _session_frames(df):
+        n_sessions += 1
+        for name, detector in ALL_DETECTORS:
+            try:
+                found = detector(local)
+            except Exception as exc:
+                print(f"  [{name}]: ERROR – {exc}")
+                continue
+            for pattern in found:
+                if index_map is None:
+                    pattern["start_idx"] = offset + int(pattern["start_idx"])
+                    pattern["end_idx"] = offset + int(pattern["end_idx"])
+                else:
+                    pattern["start_idx"] = int(index_map[int(pattern["start_idx"])])
+                    pattern["end_idx"] = int(index_map[int(pattern["end_idx"])])
+            counts[name] += len(found)
             all_patterns.extend(found)
-        except Exception as exc:
-            print(f"  [{name}]: ERROR – {exc}")
+
+    print(f"  [sessions]: {n_sessions} trading day(s), intraday only")
+    for name, n in counts.items():
+        print(f"  [{name}]: {n} pattern(s) found")
 
     if not all_patterns:
         return pd.DataFrame()
 
     result = pd.DataFrame(all_patterns)
+    start_day = pd.to_datetime(result["start_date"], utc=True).dt.tz_localize(None).dt.normalize()
+    end_day = pd.to_datetime(result["end_date"], utc=True).dt.tz_localize(None).dt.normalize()
+    result = result.loc[start_day.values == end_day.values].copy()
     result = result.sort_values("end_date", ascending=False).reset_index(drop=True)
 
     # Remove near-duplicate patterns (same pattern, close start/end)

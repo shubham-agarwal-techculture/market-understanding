@@ -22,6 +22,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from pattern_detector.config import CHART_DIR, SYMBOL
+from pattern_detector.utils import session_bounds
 
 # ── Colour palette ─────────────────────────────────────────────────────────────
 BG       = "#0d1117"
@@ -55,10 +56,11 @@ def plot_pattern(df: pd.DataFrame, pattern_row: dict,
     start_idx = pattern_row["start_idx"]
     end_idx   = pattern_row["end_idx"]
 
-    # Context: 30 bars before & after the pattern
+    # Context stays inside the same trading session
     ctx = 30
-    s = max(0, start_idx - ctx)
-    e = min(len(df) - 1, end_idx + ctx)
+    day_s, day_e = session_bounds(df.index, start_idx)
+    s = max(day_s, start_idx - ctx)
+    e = min(day_e, end_idx + ctx)
     df_slice = df.iloc[s: e + 1].reset_index()
 
     # Map original indices to slice indices
@@ -110,19 +112,55 @@ def plot_pattern(df: pd.DataFrame, pattern_row: dict,
         ax_c.text(len(df_slice) + 0.5, price, f" {label}\n ₹{price:,.0f}",
                   color=color, fontsize=7.5, va="center", ha="left", zorder=5)
 
-    # ── Key levels from the pattern dict ─────────────────────────────────────
+    # ── Key price levels (skip slopes — they are not prices) ────────────────
+    ref_price = float(df_slice["close"].median())
     kl = pattern_row.get("key_levels", {})
-    for k, v in kl.items():
-        ax_c.axhline(v, color=GOLD, linestyle=":", linewidth=0.9, alpha=0.5)
-        ax_c.text(pe, v, f" {k}={v:,.0f}", color=GOLD, fontsize=6.5,
-                  va="bottom", ha="left", alpha=0.8)
+    if isinstance(kl, dict):
+        for k, v in kl.items():
+            if v is None or "slope" in str(k).lower():
+                continue
+            try:
+                price = float(v)
+            except (TypeError, ValueError):
+                continue
+            if not np.isfinite(price) or ref_price <= 0:
+                continue
+            if abs(price - ref_price) / ref_price > 0.15:
+                continue
+            ax_c.axhline(price, color=GOLD, linestyle=":", linewidth=0.9, alpha=0.5)
+            ax_c.text(pe, price, f" {k}={price:,.0f}", color=GOLD, fontsize=6.5,
+                      va="bottom", ha="left", alpha=0.8)
+
+    # Keep the price scale on the candles, not on stray level values
+    level_prices = [
+        float(p) for p, *_ in (
+            (pattern_row.get("entry"),),
+            (pattern_row.get("stop_loss"),),
+            (pattern_row.get("target"),),
+        )
+        if p is not None and np.isfinite(float(p))
+    ]
+    lo = float(df_slice["low"].min())
+    hi = float(df_slice["high"].max())
+    if level_prices:
+        lo = min(lo, min(level_prices))
+        hi = max(hi, max(level_prices))
+    pad = (hi - lo) * 0.08 or 1.0
+    ax_c.set_ylim(lo - pad, hi + pad)
 
     # ── Volume bars ───────────────────────────────────────────────────────────
     for i, row in enumerate(df_slice.itertuples()):
         col = GREEN if row.close >= row.open else RED
         ax_v.bar(i, row.volume, color=col, alpha=0.7, width=0.7)
 
-    ax_v.yaxis.set_major_formatter(ticker.FuncFormatter(lambda x, _: f"{x/1e6:.1f}M"))
+    vmax = float(df_slice["volume"].max() or 0)
+    if vmax >= 1_000_000:
+        vol_fmt = lambda x, _: f"{x/1e6:.1f}M"
+    elif vmax >= 1_000:
+        vol_fmt = lambda x, _: f"{x/1e3:.0f}K"
+    else:
+        vol_fmt = lambda x, _: f"{x:.0f}"
+    ax_v.yaxis.set_major_formatter(ticker.FuncFormatter(vol_fmt))
 
     # ── X-axis date labels ────────────────────────────────────────────────────
     dates = df_slice["date"] if "date" in df_slice.columns else df_slice.index

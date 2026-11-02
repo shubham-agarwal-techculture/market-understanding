@@ -118,8 +118,13 @@ def build_trade_file(patterns_df: pd.DataFrame) -> pd.DataFrame:
     # Re-number trade IDs
     df_trades["trade_id"] = [f"T{i+1:04d}" for i in range(len(df_trades))]
 
-    # Save CSV
-    df_trades.to_csv(TRADE_FILE, index=False)
-    print(f"[trade_gen] ✅  {len(df_trades)} trade(s) written → {TRADE_FILE}")
+    # Save CSV. A file left open in Excel still returns the in-memory trades.
+    try:
+        df_trades.to_csv(TRADE_FILE, index=False)
+        print(f"[trade_gen] ✅  {len(df_trades)} trade(s) written → {TRADE_FILE}")
+    except PermissionError:
+        alt = os.path.join(os.path.dirname(TRADE_FILE), "trades_updated.csv")
+        df_trades.to_csv(alt, index=False)
+        print(f"[trade_gen] trades.csv is locked. Wrote {len(df_trades)} trade(s) → {alt}")
 
     return df_trades

@@ -10,7 +10,7 @@ Creates a rich, dark-themed, fully self-contained HTML report with:
 """
 from __future__ import annotations
 
-import os, sys, base64, json
+import os, sys, json
 from datetime import datetime
 from pathlib import Path
 
@@ -19,15 +19,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from pattern_detector.config import SYMBOL, CAPITAL, REPORT_FILE
-
-
-def _img_to_b64(path: str) -> str:
-    """Encode image file to base64 for embedding."""
-    try:
-        with open(path, "rb") as f:
-            return base64.b64encode(f.read()).decode()
-    except Exception:
-        return ""
+from pattern_detector.utils import session_bounds
 
 
 def _direction_badge(direction: str) -> str:
@@ -49,6 +41,143 @@ def _conf_bar(conf: float) -> str:
         f'style="width:{pct}%;background:{color}"></div></div>'
         f'<small style="color:{color}">{pct}%</small>'
     )
+
+
+def _unix(ts) -> int:
+    t = pd.Timestamp(ts)
+    if t.tzinfo is None:
+        t = t.tz_localize("UTC")
+    return int(t.timestamp())
+
+
+def _match_key(pattern, start, entry) -> tuple:
+    return (str(pattern), str(start)[:19], round(float(entry), 2))
+
+
+def _compress_window(sl: pd.DataFrame, max_bars: int = 1200) -> pd.DataFrame:
+    """Bucket a long window so the interactive chart stays responsive."""
+    n = len(sl)
+    if n <= max_bars:
+        return sl
+    step = int(np.ceil(n / max_bars))
+    rows = []
+    idx = []
+    for i in range(0, n, step):
+        chunk = sl.iloc[i:i + step]
+        rows.append({
+            "open": float(chunk["open"].iloc[0]),
+            "high": float(chunk["high"].max()),
+            "low": float(chunk["low"].min()),
+            "close": float(chunk["close"].iloc[-1]),
+            "volume": float(chunk["volume"].sum()),
+        })
+        idx.append(chunk.index[0])
+    return pd.DataFrame(rows, index=pd.DatetimeIndex(idx))
+
+
+def _price_lines(trade: pd.Series) -> list:
+    specs = [
+        ("Entry", trade.get("entry_price"), "#388bfd"),
+        ("Stop", trade.get("stop_loss"), "#f85149"),
+        ("T1", trade.get("target_1R"), "#26a641"),
+        ("T2", trade.get("target_2R"), "#3fb950"),
+        ("T3", trade.get("target_3R"), "#56d364"),
+    ]
+    lines = []
+    for name, value, color in specs:
+        try:
+            price = float(value)
+        except (TypeError, ValueError):
+            continue
+        if not np.isfinite(price):
+            continue
+        lines.append([name, round(price, 2), color])
+    return lines
+
+
+def _build_chart_payload(
+    patterns_df: pd.DataFrame,
+    trades_df: pd.DataFrame,
+    df_ohlc: pd.DataFrame | None,
+) -> dict:
+    """OHLC windows keyed by trade id, for the interactive chart."""
+    if df_ohlc is None or df_ohlc.empty or patterns_df.empty or trades_df.empty:
+        return {}
+    if "start_idx" not in patterns_df.columns or "end_idx" not in patterns_df.columns:
+        return {}
+
+    by_key: dict[tuple, pd.Series] = {}
+    for _, tr in trades_df.iterrows():
+        try:
+            key = _match_key(tr.get("pattern"), tr.get("pattern_start"), tr.get("entry_price"))
+        except (TypeError, ValueError):
+            continue
+        by_key[key] = tr
+
+    payload: dict[str, dict] = {}
+    ctx = 50
+    for _, pat in patterns_df.iterrows():
+        try:
+            key = _match_key(pat.get("pattern"), pat.get("start_date"), pat.get("entry"))
+        except (TypeError, ValueError):
+            continue
+        trade = by_key.get(key)
+        if trade is None:
+            continue
+
+        start_idx = int(pat["start_idx"])
+        end_idx = int(pat["end_idx"])
+        day_s, day_e = session_bounds(df_ohlc.index, start_idx)
+        s = max(day_s, start_idx - ctx)
+        e = min(day_e, end_idx + ctx)
+        window = _compress_window(df_ohlc.iloc[s:e + 1])
+        if window.empty:
+            continue
+
+        candles = []
+        volume = []
+        labels = []
+        real_times = []
+        # Bar slots are packed together so overnight gaps do not split the pattern.
+        for ts, row in window.iterrows():
+            o, h, l, c = float(row["open"]), float(row["high"]), float(row["low"]), float(row["close"])
+            if not all(np.isfinite(v) for v in (o, h, l, c)):
+                continue
+            real_times.append(_unix(ts))
+            slot = 1_700_000_000 + len(candles) * 60
+            labels.append(pd.Timestamp(ts).strftime("%d %b %H:%M"))
+            candles.append([slot, round(o, 2), round(h, 2), round(l, 2), round(c, 2)])
+            up = 1 if c >= o else 0
+            volume.append([slot, int(row["volume"]), up])
+
+        if len(candles) < 2:
+            continue
+
+        def _slot_for(target: int) -> int:
+            j = min(range(len(real_times)), key=lambda i: abs(real_times[i] - target))
+            return 1_700_000_000 + j * 60
+
+        mark_start = _slot_for(_unix(df_ohlc.index[start_idx]))
+        mark_end = _slot_for(_unix(df_ohlc.index[end_idx]))
+
+        tid = str(trade.get("trade_id"))
+        direction = str(trade.get("direction", "")).upper()
+        payload[tid] = {
+            "title": f"{tid}  ·  {trade.get('pattern')}  ·  {direction}",
+            "sub": (
+                f"Entry ₹{float(trade.get('entry_price', 0)):,.2f}"
+                f"   Stop ₹{float(trade.get('stop_loss', 0)):,.2f}"
+                f"   T1 ₹{float(trade.get('target_1R', 0)):,.2f}"
+                f"   T2 ₹{float(trade.get('target_2R', 0)):,.2f}"
+                f"   T3 ₹{float(trade.get('target_3R', 0)):,.2f}"
+            ),
+            "candles": candles,
+            "labels": labels,
+            "volume": volume,
+            "lines": _price_lines(trade),
+            "marks": [mark_start, mark_end],
+        }
+    return payload
 
 
 def generate_report(
@@ -81,20 +210,21 @@ def generate_report(
     rr_vals   = trades_df["risk_reward"].tolist() if n_trades else []
     rr_data   = json.dumps(rr_vals)
 
+    # ── Interactive chart windows (replaces PNG snapshots) ───────────────────
+    chart_payload = _build_chart_payload(patterns_df, trades_df, df_ohlc)
+    chart_json = json.dumps(chart_payload, separators=(",", ":")).replace("<", "\\u003c")
+
     # ── Trade rows HTML ───────────────────────────────────────────────────────
     trade_rows = ""
     if n_trades:
         for _, tr in trades_df.iterrows():
             tid   = tr.get("trade_id", "—")
-            chart_path = charts.get(str(tid), "")
-            thumb_html = ""
-            if chart_path and os.path.exists(chart_path):
-                b64 = _img_to_b64(chart_path)
-                if b64:
-                    thumb_html = (
-                        f'<img src="data:image/png;base64,{b64}" '
-                        f'class="thumb" onclick="openModal(this)" />'
-                    )
+            thumb_html = "—"
+            if str(tid) in chart_payload:
+                thumb_html = (
+                    f'<button type="button" class="chart-btn" '
+                    f'onclick="openChart(\'{tid}\')">View chart</button>'
+                )
 
             rr   = tr.get("risk_reward", 0)
             conf = tr.get("confidence", 0)
@@ -132,6 +262,7 @@ def generate_report(
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{SYMBOL} – Chart Pattern Report</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
 <style>
   *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
@@ -169,7 +300,7 @@ def generate_report(
                 border-radius: var(--radius); padding: 18px; box-shadow: var(--shadow); }}
   .chart-box h3 {{ font-size: 12px; text-transform: uppercase; letter-spacing: .5px;
                    color: var(--muted); margin-bottom: 14px; }}
-  canvas {{ max-height: 220px !important; }}
+  .chart-box canvas {{ max-height: 220px; }}
 
   /* ── Section ── */
   .section {{ background: var(--surface); border: 1px solid var(--border);
@@ -202,17 +333,30 @@ def generate_report(
   .conf-bar-bg {{ background: #21262d; border-radius: 3px; height: 5px; margin-bottom: 3px; }}
   .conf-bar    {{ height: 5px; border-radius: 3px; transition: width .4s; }}
 
-  /* ── Thumbnails / Modal ── */
-  .thumb {{ width: 110px; height: 65px; object-fit: cover; border-radius: 5px;
-            cursor: pointer; border: 1px solid var(--border); transition: transform .2s; }}
-  .thumb:hover {{ transform: scale(1.08); border-color: var(--accent); }}
+  /* ── Interactive chart ── */
+  .chart-btn {{ background:#21262d; color:var(--text); border:1px solid var(--accent);
+                border-radius:5px; padding:5px 10px; cursor:pointer; font-size:11px;
+                font-weight:600; font-family:inherit; white-space:nowrap; }}
+  .chart-btn:hover {{ background:var(--accent); color:#fff; }}
   .modal-overlay {{ display:none; position:fixed; inset:0; background:rgba(0,0,0,.88);
-                    z-index:1000; align-items:center; justify-content:center; }}
+                    z-index:1000; align-items:center; justify-content:center; padding:24px; }}
   .modal-overlay.active {{ display:flex; }}
-  .modal-overlay img {{ max-width:92vw; max-height:88vh; border-radius:8px;
-                        box-shadow: 0 0 60px rgba(0,0,0,.9); }}
-  .modal-close {{ position:fixed; top:20px; right:28px; color:#fff; font-size:28px;
-                  cursor:pointer; z-index:1001; line-height:1; }}
+  .chart-panel {{ width:min(1200px, 96vw); height:min(820px, 92vh); background:var(--bg);
+                  border:1px solid var(--border); border-radius:12px;
+                  box-shadow:0 0 60px rgba(0,0,0,.9); display:flex; flex-direction:column;
+                  overflow:hidden; }}
+  .chart-panel.is-max {{ position:fixed; inset:0; width:100vw; height:100vh;
+                         max-width:none; max-height:none; border-radius:0; z-index:1100; }}
+  .chart-head {{ display:flex; align-items:center; justify-content:space-between; gap:16px;
+                 padding:14px 16px; border-bottom:1px solid var(--border); background:var(--surface); }}
+  .chart-head h3 {{ color:#fff; font-size:14px; font-weight:600; }}
+  .chart-head p {{ color:var(--muted); font-size:11px; margin-top:4px; }}
+  .chart-actions {{ display:flex; gap:8px; flex-shrink:0; }}
+  .chart-actions button {{ background:#21262d; color:var(--text); border:1px solid var(--border);
+                           border-radius:6px; padding:6px 12px; cursor:pointer; font-family:inherit;
+                           font-size:12px; font-weight:600; }}
+  .chart-actions button:hover {{ border-color:var(--accent); color:#fff; }}
+  #lw-chart {{ flex:1; min-height:0; width:100%; }}
 
   /* ── Scrollbar ── */
   ::-webkit-scrollbar {{ width:6px; height:6px; }}
@@ -228,7 +372,7 @@ def generate_report(
   <div>
     <h1>📊 <span>{SYMBOL}</span> – Chart Pattern Analysis</h1>
     <p style="color:var(--muted);font-size:12px;margin-top:4px">
-      Powered by TheChartGuys Pattern Framework · QuestDB · 1-min OHLCV
+      Powered by TheChartGuys Pattern Framework · QuestDB · 1-min OHLCV · Intraday only
     </p>
   </div>
   <div class="meta">
@@ -329,10 +473,21 @@ def generate_report(
 
 </main>
 
-<!-- ── Image Modal ────────────────────────────────────────────────────────── -->
-<div class="modal-overlay" id="modal" onclick="closeModal()">
-  <span class="modal-close" onclick="closeModal()">✕</span>
-  <img id="modal-img" src="" alt="Chart">
+<!-- ── Maximizable candlestick chart ─────────────────────────────────────── -->
+<div class="modal-overlay" id="chart-modal" onclick="if(event.target===this) closeChart(true)">
+  <div class="chart-panel" id="chart-panel" role="dialog" aria-modal="true" aria-labelledby="chart-title">
+    <div class="chart-head">
+      <div>
+        <h3 id="chart-title">Chart</h3>
+        <p id="chart-sub"></p>
+      </div>
+      <div class="chart-actions">
+        <button type="button" id="max-btn" onclick="toggleMaximize()">Maximize</button>
+        <button type="button" onclick="closeChart(true)">Close</button>
+      </div>
+    </div>
+    <div id="lw-chart"></div>
+  </div>
 </div>
 
 <footer>
@@ -390,15 +545,140 @@ new Chart(document.getElementById('rrChart'), {{
                y: {{ ticks: {{ font: {{ size: 9 }}, stepSize: 1 }} }} }} }}
 }});
 
-// ── Modal ─────────────────────────────────────────────────────────────────────
-function openModal(img) {{
-  document.getElementById('modal-img').src = img.src;
-  document.getElementById('modal').classList.add('active');
+// ── Interactive candlestick chart ─────────────────────────────────────────────
+const CHARTS = {chart_json};
+let lwChart = null;
+let lwResize = null;
+
+function destroyChart() {{
+  if (lwResize) {{ lwResize.disconnect(); lwResize = null; }}
+  if (lwChart) {{ lwChart.remove(); lwChart = null; }}
 }}
-function closeModal() {{
-  document.getElementById('modal').classList.remove('active');
+
+function fitChart() {{
+  if (!lwChart) return;
+  const el = document.getElementById('lw-chart');
+  lwChart.resize(el.clientWidth, el.clientHeight);
 }}
-document.addEventListener('keydown', e => {{ if(e.key==='Escape') closeModal(); }});
+
+function renderChart(spec) {{
+  destroyChart();
+  const el = document.getElementById('lw-chart');
+  if (typeof LightweightCharts === 'undefined') {{
+    el.innerHTML = '<p style="padding:24px;color:#f85149">Chart library failed to load. Check your network connection and reload the report.</p>';
+    return;
+  }}
+  el.innerHTML = '';
+  const labelByTime = {{}};
+  spec.candles.forEach((c, i) => {{ labelByTime[c[0]] = (spec.labels && spec.labels[i]) || ''; }});
+  lwChart = LightweightCharts.createChart(el, {{
+    autoSize: true,
+    layout: {{ background: {{ color: '#0d1117' }}, textColor: '#c9d1d9' }},
+    grid: {{ vertLines: {{ color: '#21262d' }}, horzLines: {{ color: '#21262d' }} }},
+    rightPriceScale: {{ borderColor: '#21262d' }},
+    localization: {{ timeFormatter: (time) => labelByTime[time] || '' }},
+    timeScale: {{
+      borderColor: '#21262d',
+      timeVisible: true,
+      secondsVisible: false,
+      tickMarkFormatter: (time) => labelByTime[time] || '',
+    }},
+    crosshair: {{ mode: LightweightCharts.CrosshairMode.Normal }},
+  }});
+  const candles = lwChart.addCandlestickSeries({{
+    upColor: '#26a641', downColor: '#f85149',
+    borderUpColor: '#26a641', borderDownColor: '#f85149',
+    wickUpColor: '#26a641', wickDownColor: '#f85149',
+  }});
+  candles.setData(spec.candles.map(c => ({{
+    time: c[0], open: c[1], high: c[2], low: c[3], close: c[4]
+  }})));
+  (spec.lines || []).forEach(line => {{
+    candles.createPriceLine({{
+      price: line[1], color: line[2], lineWidth: 1,
+      lineStyle: LightweightCharts.LineStyle.Dashed,
+      axisLabelVisible: true, title: line[0],
+    }});
+  }});
+  if (spec.marks && spec.marks.length === 2) {{
+    candles.setMarkers([
+      {{ time: spec.marks[0], position: 'aboveBar', color: '#e3b341', shape: 'arrowDown', text: 'Start' }},
+      {{ time: spec.marks[1], position: 'aboveBar', color: '#e3b341', shape: 'arrowDown', text: 'End' }},
+    ]);
+  }}
+  const hasVolume = (spec.volume || []).some(v => v[1] > 0);
+  if (hasVolume) {{
+    const volume = lwChart.addHistogramSeries({{
+      priceFormat: {{ type: 'volume' }},
+      priceScaleId: 'vol',
+    }});
+    volume.setData(spec.volume.map(v => ({{
+      time: v[0], value: v[1], color: v[2] ? '#26a64188' : '#f8514988'
+    }})));
+    lwChart.priceScale('vol').applyOptions({{ scaleMargins: {{ top: 0.82, bottom: 0 }} }});
+  }}
+  lwChart.timeScale().fitContent();
+  lwResize = new ResizeObserver(() => fitChart());
+  lwResize.observe(el);
+}}
+
+function openChart(id) {{
+  const spec = CHARTS[id];
+  if (!spec) return;
+  document.getElementById('chart-title').textContent = spec.title;
+  document.getElementById('chart-sub').textContent = spec.sub;
+  document.getElementById('chart-modal').classList.add('active');
+  document.body.style.overflow = 'hidden';
+  requestAnimationFrame(() => renderChart(spec));
+}}
+
+function restoreChart() {{
+  const panel = document.getElementById('chart-panel');
+  panel.classList.remove('is-max');
+  document.getElementById('max-btn').textContent = 'Maximize';
+  if (document.fullscreenElement) document.exitFullscreen();
+  setTimeout(fitChart, 60);
+}}
+
+function closeChart(force) {{
+  const panel = document.getElementById('chart-panel');
+  const open = document.getElementById('chart-modal').classList.contains('active');
+  if (!open) return;
+  const maximized = panel.classList.contains('is-max') || !!document.fullscreenElement;
+  if (maximized && !force) {{
+    restoreChart();
+    return;
+  }}
+  panel.classList.remove('is-max');
+  document.getElementById('max-btn').textContent = 'Maximize';
+  if (document.fullscreenElement) document.exitFullscreen();
+  document.getElementById('chart-modal').classList.remove('active');
+  document.body.style.overflow = '';
+  destroyChart();
+}}
+
+function toggleMaximize() {{
+  const panel = document.getElementById('chart-panel');
+  const on = !panel.classList.contains('is-max');
+  panel.classList.toggle('is-max', on);
+  document.getElementById('max-btn').textContent = on ? 'Restore' : 'Maximize';
+  if (on && panel.requestFullscreen) {{
+    panel.requestFullscreen().catch(() => {{}});
+  }} else if (!on && document.fullscreenElement) {{
+    document.exitFullscreen();
+  }}
+  setTimeout(fitChart, 60);
+}}
+
+document.addEventListener('fullscreenchange', () => {{
+  const panel = document.getElementById('chart-panel');
+  if (!document.fullscreenElement && panel.classList.contains('is-max')) {{
+    panel.classList.remove('is-max');
+    document.getElementById('max-btn').textContent = 'Maximize';
+  }}
+  setTimeout(fitChart, 60);
+}});
+document.addEventListener('keydown', e => {{ if (e.key === 'Escape') closeChart(false); }});
 
 // ── Table sort ────────────────────────────────────────────────────────────────
 function sortTable(col) {{

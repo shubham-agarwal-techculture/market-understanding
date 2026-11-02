@@ -1,6 +1,6 @@
 # 📊 Chart Pattern Detection System — NIFTY 50
 
-> Automated technical analysis pipeline that fetches live OHLCV data from **QuestDB**, detects **18 chart patterns** based on the [TheChartGuys Pattern Framework](https://www.chartguys.com), generates **trade setups** with full risk management, produces **annotated candlestick charts**, and compiles everything into a **dark-themed interactive HTML report**.
+> Automated technical analysis pipeline that fetches live OHLCV data from **QuestDB**, detects **18 chart patterns** based on the [TheChartGuys Pattern Framework](https://www.chartguys.com), and keeps every pattern inside a **single trading session**. It builds **trade setups** with full risk management and a **dark-themed HTML report** whose candlestick chart can be maximized.
 
 ---
 
@@ -30,13 +30,16 @@
 This system is designed for **systematic technical analysis** of Indian equity indices, specifically **NSE NIFTY 50**. It automates the entire workflow a human chartist would follow:
 
 ```
-QuestDB (Live OHLCV)
+QuestDB (Live 1-min OHLCV)
        |
        v
-  Resample to 15-min bars
+  Optional resample (default: keep 1-min bars)
        |
        v
-  Detect 18 Chart Patterns (swing pivots + trendline fitting)
+  Split into trading sessions (one calendar day each)
+       |
+       v
+  Detect 18 Chart Patterns inside each session
        |
        v
   Calculate Entry / Stop-Loss / Target levels per pattern
@@ -45,13 +48,15 @@ QuestDB (Live OHLCV)
   Size positions using fixed-risk % of capital
        |
        v
-  Generate annotated PNG charts (1 per trade)
+  HTML report with a maximizable candlestick chart
+  Optional PNG charts (--no-charts skips them)
        |
        v
-  Build interactive HTML report + CSV trade file
+  CSV trade file
 ```
 
 **Key design principles:**
+- **Intraday only** — detectors never connect the close of one session to the open of the next
 - **No manual intervention** — fully automated from raw OHLCV to trade file
 - **All patterns from TheChartGuys cheat sheet** — reversal and continuation
 - **Risk-first sizing** — every trade risks exactly 1% of capital by default
@@ -83,10 +88,10 @@ QuestDB (Live OHLCV)
 | Step | Module | Input | Output |
 |------|--------|-------|--------|
 | 1 | `data_loader.py` | QuestDB table `nse_nifty_50` | Resampled OHLCV DataFrame |
-| 2 | `patterns.py` | OHLCV DataFrame | List of pattern dicts |
+| 2 | `patterns.py` | One session of OHLCV at a time | Intraday pattern dicts |
 | 3 | `trade_generator.py` | Pattern list | `trades.csv` |
-| 4 | `chart_generator.py` | OHLCV + patterns | PNG chart files |
-| 5 | `report_generator.py` | Patterns + trades + charts | `report.html` |
+| 4 | `chart_generator.py` | OHLCV + patterns | Optional PNG files |
+| 5 | `report_generator.py` | Patterns + trades + OHLCV | `report.html` with a maximizable chart |
 
 ---
 
@@ -101,11 +106,11 @@ market_understanding/
 |   +-- __init__.py
 |   +-- config.py                   # All tunable parameters
 |   +-- data_loader.py              # QuestDB REST API + resampling
-|   +-- utils.py                    # Shared helpers (swings, ATR, trendlines)
+|   +-- utils.py                    # Swings, ATR, trendlines, session bounds
 |   +-- patterns.py                 # 18 pattern detector functions
 |   +-- trade_generator.py          # Trade file builder with position sizing
-|   +-- chart_generator.py          # Dark-themed candlestick chart renderer
-|   +-- report_generator.py         # Self-contained HTML report generator
+|   +-- chart_generator.py          # Optional dark-themed PNG renderer
+|   +-- report_generator.py         # HTML report and maximizable candlestick chart
 |
 +-- pattern_detector/output/        # Generated outputs (auto-created)
     +-- trades.csv                  # Trade setups (CSV)
@@ -156,7 +161,13 @@ These form during a trend pause and signal resumption.
 
 ## 🔍 How Pattern Detection Works
 
-### Step 1 — Swing Pivot Detection
+### Step 1 — One trading session at a time
+
+`detect_all_patterns()` splits the series on the calendar date of each bar and runs every detector on that day alone. A pattern's `start_date` and `end_date` are always the same session. Chart windows use the same bound, so the candlestick view does not pull in the previous close or the next open.
+
+On the default 1-minute series, one session is the cash-market day (about 09:15–15:30). A higher resample such as `15min` or `1H` is still scanned one calendar day at a time.
+
+### Step 2 — Swing Pivot Detection
 
 All pattern detectors start by identifying **swing highs** and **swing lows** using `scipy.signal.argrelextrema`:
 
@@ -170,7 +181,7 @@ find_swing_lows(df, window=PIVOT_WINDOW)
 
 > **Tip:** Increasing `PIVOT_WINDOW` in `config.py` finds larger, more significant swings and reduces noise patterns.
 
-### Step 2 — Pattern Geometry Checks
+### Step 3 — Pattern Geometry Checks
 
 Each detector applies **structural rules** specific to the pattern:
 
@@ -182,7 +193,7 @@ Each detector applies **structural rules** specific to the pattern:
 | Bar spacing | Double Top peaks must be >= `2 x PIVOT_WINDOW` bars apart |
 | Trendline R-squared | Wedges/Triangles require `R >= 0.7` for fit quality |
 
-### Step 3 — Trendline Fitting
+### Step 4 — Trendline Fitting
 
 For patterns requiring trendlines (wedges, triangles, channels, pennants), **linear regression** is used via `scipy.stats.linregress`:
 
@@ -192,7 +203,7 @@ slope, intercept, r_value = linregress(x_indices, prices)
 
 The `r_value` (correlation) gates pattern acceptance — poor fits are rejected.
 
-### Step 4 — Volume Confirmation
+### Step 5 — Volume Confirmation
 
 If `VOLUME_CONFIRM = True`, the breakout bar's volume must be >= `VOLUME_MULT x 20-bar average`:
 
@@ -200,7 +211,7 @@ If `VOLUME_CONFIRM = True`, the breakout bar's volume must be >= `VOLUME_MULT x 
 volume_spike(df, breakout_idx, period=20, mult=1.3)
 ```
 
-### Step 5 — Confidence Score
+### Step 6 — Confidence Score
 
 Each detected pattern receives a `confidence` score (0–1) composed of:
 
@@ -276,7 +287,9 @@ Quantity   = floor(Risk Rs / Risk/unit)
 
 ## 📄 Output Files
 
-### 1. `output/trades.csv`
+Generated files live in `pattern_detector/output/`.
+
+### 1. `pattern_detector/output/trades.csv`
 
 The primary trade file. One row per trade setup, sorted by confidence (highest first).
 
@@ -306,29 +319,34 @@ The primary trade file. One row per trade setup, sorted by confidence (highest f
 | `notes` | string | Detection details |
 | `status` | string | `PENDING` (update manually after execution) |
 
-### 2. `output/report.html`
+If `trades.csv` is open in another program and cannot be overwritten, the same rows are written to `trades_updated.csv` and the pipeline continues.
 
-A **self-contained, dark-themed interactive HTML report** that includes:
+### 2. `pattern_detector/output/report.html`
+
+A **dark-themed HTML report**. Trade rows and candle data are embedded in the file. Chart.js and Lightweight Charts are loaded from a CDN, so the page needs a network connection the first time those scripts are fetched.
+
+The report includes:
 
 - **9 summary cards** — patterns found, bullish/bearish count, avg R:R, avg confidence, total risk Rs
 - **3 Chart.js charts** — pattern frequency bar, bullish/bearish doughnut, R:R distribution histogram
-- **Sortable trade table** — all trades, click any column header to sort
-- **Embedded chart thumbnails** — click to open full-size modal
+- **Sortable trade table** — click a column header to sort
+- **View chart** — opens an interactive candlestick chart for that setup
+- **Maximize / Restore** — the chart fills the browser window; Escape restores first, then closes
 - **Pattern notes** — detection rationale inline in each row
 
-> Open `report.html` directly in any modern browser — no server needed, all assets are inlined.
+The candlestick chart shows the pattern's own session only, with a short run of bars before and after it. Entry, stop, T1, T2, and T3 are drawn as price lines. Start and end of the pattern are marked. Drag to pan and scroll to zoom. When the session's volume is all zeros, the volume pane is omitted.
 
-### 3. `output/charts/*.png`
+### 3. `pattern_detector/output/charts/*.png`
 
-Per-pattern dark-themed candlestick charts (120 DPI, 16:9 aspect) showing:
+Optional dark-themed candlestick images (120 DPI, 16:9), written unless you pass `--no-charts`. The report does not use these files. Each PNG is limited to the same trading session as the pattern and shows:
 
 - **Candlesticks** — green (bullish) / red (bearish) with wicks
 - **Pattern span** — amber shaded region highlighting the pattern formation
 - **Entry level** — dashed blue horizontal line
 - **Stop Loss** — dotted red horizontal line
 - **Target** — dashed green horizontal line
-- **Key levels** — pattern-specific annotations (neckline, peaks, etc.)
-- **Volume bars** — bottom panel
+- **Key price levels** — neckline, peaks, support, resistance (slope values are not drawn as prices)
+- **Volume bars** — bottom panel, scaled to the session's volume
 
 ---
 
@@ -349,14 +367,15 @@ SYMBOL        = "NIFTY 50"                   # Display name in reports
 ```python
 LOOKBACK_DAYS = 365        # How many days of history to fetch
 TIMEFRAME     = "1min"     # Source data resolution (informational)
-RESAMPLE_TO   = "15min"    # Resample target -- affects pattern granularity
+RESAMPLE_TO   = "1min"     # Resample target -- affects pattern granularity
                             # Options: "1min","5min","15min","30min","1H","1D"
 ```
 
-> **Resample guidance:**
-> - `15min` -> Intraday swing trading (default)
-> - `1H` -> Medium-term position trades
-> - `1D` -> Multi-day/swing trades, requires more historical data
+> **Resample guidance:** detection is always one calendar day at a time.
+> - `1min` -> default; raw bars. A 2% flag pole must happen within 10 one-minute bars, so few flags qualify
+> - `5min` / `15min` -> intraday swings that are easier for the geometry rules to accept
+> - `1H` -> a handful of bars per session; only short patterns can complete
+> - `1D` -> one bar per session, so session-scoped detection cannot form multi-bar patterns
 
 ### Pattern Detection Thresholds
 
@@ -384,7 +403,7 @@ SL_BUFFER_PCT        = 0.002   # 0.2% buffer beyond pattern extreme for SL
 
 | Goal | Parameter to adjust |
 |------|-------------------|
-| Find more patterns | Decrease `PRICE_TOLERANCE_PCT`, decrease `MIN_PATTERN_DEPTH_PCT` |
+| Find more intraday patterns | Use `--resample 5min` or `--resample 15min`; or decrease `MIN_PATTERN_DEPTH_PCT` |
 | Find fewer, cleaner patterns | Increase `PIVOT_WINDOW`, increase `MIN_PATTERN_DEPTH_PCT` |
 | Higher R:R trades only | Increase `DEFAULT_RISK_REWARD` |
 | Tighter stops | Decrease `SL_BUFFER_PCT` |
@@ -403,7 +422,9 @@ SL_BUFFER_PCT        = 0.002   # 0.2% buffer beyond pattern extreme for SL
 ### Install Dependencies
 
 ```bash
-pip install pandas numpy requests scipy matplotlib mplfinance
+python -m venv .venv
+.venv\Scripts\activate
+pip install -r requirements.txt
 ```
 
 All dependencies are standard and widely available:
@@ -444,7 +465,8 @@ python run.py
 ```
 
 This runs with defaults from `config.py`:
-- **15-minute** bars, **last 365 days**, up to **30 charts**
+- **1-minute** bars, **last 365 days**, patterns kept inside each session
+- Up to **30 PNG charts**, plus the HTML report with a maximizable chart for every trade
 
 ### Full Run with All Charts
 
@@ -458,11 +480,13 @@ python run.py --max-charts 100
 python run.py --resample 1H --days 365
 ```
 
-### Fast Run (No Charts)
+### Report only (skip PNG files)
 
 ```bash
 python run.py --no-charts
 ```
+
+The HTML report and its maximizable charts are still written.
 
 ### Last 3 Months Only
 
@@ -484,17 +508,18 @@ options:
 
   --resample RESAMPLE   Timeframe to resample 1-min data to before analysis.
                         Options: 1min, 5min, 15min, 30min, 1H, 1D
-                        Default: value from config.py (15min)
+                        Default: value from config.py (1min)
+                        Patterns still cannot cross from one calendar day
+                        into the next.
 
   --days DAYS           Number of calendar days to look back from today.
                         Default: value from config.py (365)
 
-  --no-charts           Skip PNG chart generation. Speeds up the pipeline
-                        significantly when you only need the CSV and report.
+  --no-charts           Skip PNG chart generation. The HTML report and its
+                        maximizable candlestick charts are still built.
 
-  --max-charts N        Maximum number of charts to generate (default: 30).
-                        Charts are generated for the top-N highest confidence
-                        trades.
+  --max-charts N        Maximum number of PNG files to write (default: 30).
+                        The report charts every trade regardless of this cap.
 ```
 
 ---
@@ -509,7 +534,7 @@ Central configuration. **All user-facing settings live here.** Change this file 
 ### `data_loader.py`
 
 ```python
-load_ohlcv(lookback_days=365, resample_to="15min") -> pd.DataFrame
+load_ohlcv(lookback_days=365, resample_to="1min") -> pd.DataFrame
 ```
 Fetches data from QuestDB REST API (`/exec` endpoint), parses timestamps to UTC-aware `DatetimeIndex`, casts OHLCV columns, and resamples to the target frequency using standard OHLC aggregation:
 - `open`   = first bar
@@ -529,6 +554,7 @@ Convenience wrapper that returns daily bars.
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
+| `session_bounds` | `(index, idx) -> (int, int)` | First and last bar of the trading day that contains `idx` |
 | `find_swing_highs` | `(df, window) -> np.ndarray` | Indices of local high pivots |
 | `find_swing_lows` | `(df, window) -> np.ndarray` | Indices of local low pivots |
 | `prices_approx_equal` | `(a, b, tol) -> bool` | Price level equality within tolerance |
@@ -575,7 +601,7 @@ Every dict in the returned list contains:
 detect_all_patterns(df: pd.DataFrame) -> pd.DataFrame
 ```
 
-Runs all 9 detector groups, deduplicates overlapping detections, and returns a single sorted DataFrame.
+Splits the frame into trading sessions, runs all 9 detector groups on each session, remaps bar indexes back onto the full series, drops anything that still spans two dates, deduplicates, and returns a single sorted DataFrame.
 
 ---
 
@@ -584,11 +610,11 @@ Runs all 9 detector groups, deduplicates overlapping detections, and returns a s
 ```python
 build_trade_file(patterns_df: pd.DataFrame) -> pd.DataFrame
 ```
-- Filters patterns below minimum R:R
 - Computes T1/T2/T3 targets
 - Calculates position size using fixed fractional risk
-- Writes `output/trades.csv`
-- Returns trades DataFrame
+- Sorts by confidence, then rewrites `trade_id` as `T0001`, `T0002`, ...
+- Writes `pattern_detector/output/trades.csv` (or `trades_updated.csv` if that file is locked)
+- Returns the trades DataFrame
 
 ---
 
@@ -597,12 +623,12 @@ build_trade_file(patterns_df: pd.DataFrame) -> pd.DataFrame
 ```python
 plot_pattern(df, pattern_row, filename=None) -> str
 ```
-Renders a single dark-themed chart for one pattern. Returns the saved PNG path.
+Renders a single dark-themed PNG for one pattern. The price scale follows the candles and the entry, stop, and target. Slope fields in `key_levels` are not plotted. Bars outside the pattern's session are left out. Returns the saved PNG path.
 
 ```python
 generate_all_charts(df, patterns_df, max_charts=30) -> dict[str, str]
 ```
-Batch renders top-N patterns. Returns `{trade_id -> chart_path}` mapping.
+Batch-renders up to `max_charts` patterns. Returns `{trade_id -> chart_path}`. The HTML report does not embed these files.
 
 ---
 
@@ -611,45 +637,35 @@ Batch renders top-N patterns. Returns `{trade_id -> chart_path}` mapping.
 ```python
 generate_report(patterns_df, trades_df, charts, df_ohlc) -> str
 ```
-Builds a fully self-contained HTML file with embedded Chart.js visualizations and base64-encoded chart images. Returns the path to `report.html`.
+Builds `report.html`. Summary charts use Chart.js. Each trade's **View chart** button opens a Lightweight Charts candlestick for that session, with Maximize / Restore. Candle windows are embedded as JSON. Returns the path to `report.html`. The `charts` argument is accepted for compatibility and is not drawn in the page.
 
 ---
 
 ## 📊 Sample Results (Last 1 Year)
 
-> Run on: **NIFTY 50** · 15-min bars · 30 Oct 2025 -> 30 Oct 2026
+> Run on: **NIFTY 50** · 1-min bars · intraday sessions only · 3 Nov 2025 -> 30 Oct 2026
 
 ### Pattern Breakdown
 
 | Pattern | Count | Direction |
 |---------|-------|-----------|
-| Bear Flag | 41 | Bearish |
-| Bull Flag | 27 | Bullish |
-| Cup and Handle | 18 | Bullish |
-| Falling Wedge | 11 | Bullish |
-| Double Top | 7 | Bearish |
-| Inverse Head & Shoulders | 4 | Bullish |
-| Rising Wedge | 4 | Bearish |
-| Triple Top | 4 | Bearish |
-| Ascending Channel | 3 | Bullish |
-| Double Bottom | 2 | Bullish |
-| Head & Shoulders | 1 | Bearish |
-| **Total** | **122** | 65 Bull / 57 Bear |
+| Cup and Handle | 1 | Bullish |
+| **Total** | **1** | 1 Bull / 0 Bear |
+
+The single setup is 1 Feb 2026, 11:54–13:04, bullish cup and handle, R:R 3.25x.
+
+On 1-minute bars a flag still needs a 2% pole inside 10 bars, and wedges still need a trendline fit of R >= 0.7. Those rules rarely complete inside one cash session, which is why the intraday pass is sparse. `--resample 15min` keeps the same one-session rule and gives the geometry more room.
 
 ### Key Metrics
 
 | Metric | Value |
 |--------|-------|
-| Total Patterns Detected | **122** |
-| Bullish Setups | **65** (53%) |
-| Bearish Setups | **57** (47%) |
-| Reversal Patterns | **33** (27%) |
-| Continuation Patterns | **89** (73%) |
-| Average Risk:Reward | **3.87x** |
-| Raw 1-min Bars Loaded | **92,762** |
-| Resampled 15-min Bars | **6,187** |
-| Pipeline Runtime | **~11 seconds** |
-| Charts Generated | **30 PNGs** |
+| Trading sessions scanned | **246** |
+| Total patterns detected | **1** |
+| Bullish setups | **1** |
+| Bearish setups | **0** |
+| Raw 1-min bars loaded | **92,205** |
+| Pipeline runtime (`--no-charts`) | **~9 seconds** |
 
 ---
 
@@ -731,14 +747,16 @@ python D:\projects-shubham\...\market_understanding\run.py --max-charts 50
 - Confirm the date range has data — try reducing `--days`
 
 ### `No patterns detected`
-- Loosen thresholds in `config.py`:
+On 1-minute data this is common: each pattern must start and finish on the same calendar day, and several detectors still want a large move or a clean trendline inside that window.
+
+- Resample inside the day: `python run.py --resample 15min`
+- Or loosen thresholds in `config.py`:
   ```python
   PIVOT_WINDOW          = 3      # was 5
   PRICE_TOLERANCE_PCT   = 0.006  # was 0.003
   MIN_PATTERN_DEPTH_PCT = 0.002  # was 0.004
   VOLUME_CONFIRM        = False  # disable volume filter
   ```
-- Try a different timeframe: `--resample 1H`
 
 ### `UnicodeEncodeError` on Windows PowerShell
 
@@ -748,10 +766,21 @@ Set the encoding environment variable before running:
 $env:PYTHONIOENCODING='utf-8'; python run.py
 ```
 
-### Charts are empty / rendering black
+### `PermissionError` writing `trades.csv`
 
-- Ensure the `output/charts/` directory is writable
-- The `Agg` (non-interactive) matplotlib backend is set automatically in `chart_generator.py` — do not change it
+The file is open in Excel or another program. Close it and run again, or use the `trades_updated.csv` written beside it. The HTML report is still produced from the in-memory trades.
+
+### The report chart does not appear
+
+- The page loads Chart.js and Lightweight Charts from a CDN. Open the report while online.
+- **View chart** is shown only when that trade matched a same-session pattern window.
+
+### PNG charts look wrong
+
+- Confirm `pattern_detector/output/charts/` is writable
+- The `Agg` matplotlib backend is set in `chart_generator.py` — leave it in place
+- Slope annotations are not prices. Only levels near the candles are drawn, and the y-axis stays on that price range
+- The PNG shows one session. Bars from the prior close are not included
 
 ### Very slow data fetch
 
@@ -767,7 +796,8 @@ $env:PYTHONIOENCODING='utf-8'; python run.py
 ## 📝 Notes & Limitations
 
 - **No backtesting** — this system detects patterns in historical data and generates forward-looking setups, but does not backtest win rate or P&L
-- **Intraday patterns** — 15-min timeframe captures intraday swings; adjust to `1D` for multi-day patterns
+- **Intraday only** — a pattern cannot cross midnight. `RESAMPLE_TO = "1D"` leaves one bar per session, so multi-bar patterns will not form. Use `5min` or `15min` for more same-day setups
+- **Report charts need a CDN** — candle data is stored in `report.html`, but Chart.js and Lightweight Charts are loaded from the network
 - **Price targets are projections** — pattern height is projected from the breakout level; actual price behavior may differ
 - **All trades start as `PENDING`** — manually update the `status` column in `trades.csv` as trades resolve:
   - `OPEN` — trade is live

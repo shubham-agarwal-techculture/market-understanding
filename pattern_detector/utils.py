@@ -10,6 +10,20 @@ from scipy.signal import argrelextrema
 from scipy.stats import linregress
 
 
+def session_bounds(index: pd.DatetimeIndex, idx: int) -> tuple[int, int]:
+    """First and last bar positions of the trading day that contains idx.
+
+    Timestamps are matched on their calendar date, so a pattern and its
+    chart stay inside one session instead of running across the overnight gap.
+    """
+    ts = pd.DatetimeIndex(index)
+    if ts.tz is not None:
+        ts = ts.tz_convert("UTC").tz_localize(None)
+    day = ts[int(idx)].normalize()
+    positions = np.flatnonzero(ts.normalize() == day)
+    return int(positions[0]), int(positions[-1])
+
+
 def find_swing_highs(df: pd.DataFrame, window: int = 5) -> np.ndarray:
     """Return indices of local swing-high bars."""
     highs = df["high"].values
